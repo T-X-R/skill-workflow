@@ -1,0 +1,32 @@
+[project]
+name = "video-skills-plateform"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "alibabacloud-ice20201109>=6.16.0",
+    "alibabacloud-tea-openapi>=0.4.4",
+    "alibabacloud-tea-util>=0.3.14",
+    "numpy>=2.4.4",
+    "openai>=2.30.0",
+    "langchain>=1.2.0",
+    "langchain-openai>=1.1.0",
+    "langgraph>=1.1.0",
+    "opencv-python>=4.13.0.92",
+    "oss2>=2.19.1",
+    "python-dotenv>=1.2.2",
+    "requests>=2.33.1",
+    "volcengine>=1.0.193",
+    "volcengine-python-sdk[ark]>=4.0.33",
+    "mediapipe==0.10.5",
+    "ultralytics>=8.3.167",
+    "moviepy==2.2.1",
+    "pydantic>=2.12.5",
+    "fastapi>=0.135.2",
+    "python-multipart>=0.0.22",
+    "langgraph-checkpoint-sqlite>=3.0.3",
+    "aiosqlite>=0.22.1",
+    "uvicorn[standard]>=0.36.0",
+    "websockets>=16.0",
+]

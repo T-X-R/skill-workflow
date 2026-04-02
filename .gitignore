@@ -1,0 +1,32 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# Environment variables (contain API keys and secrets)
+.env
+.env.*
+
+# Runtime data
+backend/data/
+*.sqlite
+*.db
+
+# Project assets (local only)
+skills/
+reference/
+
+# Logs
+*.log
+
+# IDE
+.cursor/
+.qoder/
+
+tmp/
