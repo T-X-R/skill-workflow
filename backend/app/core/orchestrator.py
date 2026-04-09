@@ -5,19 +5,22 @@
 - Workflow 模版执行（含 execution_policy 和 quality_gate）
 - 动态质检与回退
 - 流式回复
+
+Skill 发现通过 SkillMiddleware 动态注入到 system prompt（progressive disclosure）。
 """
 
 from __future__ import annotations
 
 import json
-import logging
 from typing import TYPE_CHECKING, AsyncGenerator
 
 from langchain.agents import create_agent
 from langchain_core.messages import AIMessageChunk
 from langgraph.store.memory import InMemoryStore
+from loguru import logger
 
-from backend.app.tools import build_all_tools, SessionContext
+from backend.app.middleware.skill_middleware import SkillMiddleware
+from backend.app.tools import build_system_tools, SessionContext
 from backend.app.models.workflow import Workflow
 from backend.app.config import TMP_DIR
 
@@ -27,21 +30,18 @@ if TYPE_CHECKING:
     from backend.app.core.llm_client import LLMClient
     from backend.app.models.session import Session
 
-logger = logging.getLogger(__name__)
-
 
 # ── System Prompt ─────────────────────────────────────────────────────
 
 def _build_system_prompt() -> str:
     tmp_dir = str(TMP_DIR)
-    return f"""你是一个专业的任务执行助手，擅长协调和执行各类处理任务。你拥有一套工具（skills）来完成具体的工作。
+    return f"""你是一个专业的任务执行助手，擅长协调和执行各类处理任务。你拥有一套工具和多个 skills 来完成具体的工作。
 
 ## 工作方式
 
-### 发现能力
-- 使用 `list_available_skills` 查看所有可用 skill
-- 使用 `load_skill_docs` 加载指定 skill 的完整文档，在执行前**必须**先了解其参数和用法
-- 使用 `run_skill_script` 执行有脚本的 skill
+### 发现与执行
+- 阅读文档，按照文档指引使用可用工具完成任务
+- 执行完成后，调用 `mark_skill_done(skill_id)` 标记完成
 
 ### 执行策略
 当执行工作流节点时，遵守每个节点的 execution_policy：
@@ -75,6 +75,13 @@ def _build_system_prompt() -> str:
 这让用户能在画布上预览完整的执行流程，然后再开始执行。
 示例：`report_execution_plan(steps='[{{"skill_id":"download","label":"下载视频"}},{{"skill_id":"volcengine-asr","label":"语音识别"}}]')`
 
+### Sub-agent 委托
+当一个 skill 配置了 `preferred_model`（推荐模型）时，可以使用 `delegate_to_subagent` 委托给独立的 sub-agent 执行（自动标记完成，无需调 `mark_skill_done`）。
+
+委托时注意：
+- **instruction 必须包含完整上下文**：sub-agent 看不到你的对话历史，所以你需要把所有必要信息（输入文件路径、参数、期望输出等）都写在 instruction 里
+- Sub-agent 执行完会返回结果文本，你需要解读并继续后续流程
+
 ### 通用工具
 除 skill 工具外，你还可以使用：
 - `run_bash`：执行 shell 命令（如 ffprobe 获取视频信息）
@@ -89,7 +96,7 @@ def _build_system_prompt() -> str:
 - 执行完毕后用简洁的语言总结结果
 
 ## 重要原则
-- 执行 skill 前，必须先用 `load_skill_docs` 了解其参数
+- 执行 skill 前，**必须**先用 `load_skill` 加载文档
 - **所有中间产物必须保存到 `{tmp_dir}` 目录**，包括：下载的视频、提取的音频、ASR JSON、字幕文件、处理后的视频等
   - `download_file` 的 `save_path` 使用 `{tmp_dir}/<filename>`
   - skill 的 `output` / `output_path` 参数使用 `{tmp_dir}/<filename>`
@@ -178,17 +185,24 @@ class Orchestrator:
         self.registry = registry
         self.checkpointer = checkpointer
         self.store = InMemoryStore()
-        self._tools = build_all_tools(registry)
+
+        self._skill_middleware = SkillMiddleware(registry)
+        self._system_tools = build_system_tools()
 
         self._agent = create_agent(
             model=llm_client.get_model(),
-            tools=self._tools,
+            tools=self._system_tools,
             system_prompt=SYSTEM_PROMPT_LAYER1,
+            middleware=[self._skill_middleware],
             context_schema=SessionContext,
             checkpointer=self.checkpointer,
             store=self.store,
         )
-        logger.info(f"Orchestrator 初始化完成，已注册 {len(self._tools)} 个工具")
+        skill_tool_count = len(self._skill_middleware.tools)
+        logger.info(
+            f"Orchestrator 初始化完成，系统工具 {len(self._system_tools)} 个，"
+            f"通过 SkillMiddleware 注入 skill {skill_tool_count} 个"
+        )
 
     def _make_config(self, session: Session) -> dict:
         return {"configurable": {"thread_id": session.id}}
@@ -264,13 +278,3 @@ class Orchestrator:
             logger.error(f"[session={session.id}] run_workflow 失败: {e}")
             yield f"\n抱歉，执行过程中遇到了问题：{str(e)}"
 
-    async def get_full_response(
-        self,
-        session: Session,
-        user_message: str,
-    ) -> str:
-        """发送消息并等待完整回复（非流式，用于批量场景）。"""
-        chunks = []
-        async for chunk in self.chat_stream(session, user_message):
-            chunks.append(chunk)
-        return "".join(chunks)

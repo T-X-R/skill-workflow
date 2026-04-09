@@ -309,6 +309,8 @@ def parse_skill_md(skill_dir: Path) -> SkillMeta | None:
     # Check for script
     script_path = skill_dir / "scripts" / "run.py"
     has_script = script_path.exists()
+
+    preferred_model = frontmatter.get('preferred_model', None) or None
     
     return SkillMeta(
         id=skill_id,
@@ -320,5 +322,6 @@ def parse_skill_md(skill_dir: Path) -> SkillMeta | None:
         params=params,
         has_script=has_script,
         script_path=str(script_path) if has_script else None,
+        preferred_model=preferred_model,
         skill_md_content=content,
     )

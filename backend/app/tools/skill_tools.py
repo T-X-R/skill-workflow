@@ -1,34 +1,29 @@
 """Skill 相关 Tools — 供 Orchestrator Agent 使用
 
-Progressive disclosure 模式：
-1. list_available_skills — 列出所有 skill 摘要（轻量，启动即可用）
-2. load_skill_docs       — 按需加载指定 skill 的完整 SKILL.md
-3. run_skill_script      — 执行指定 skill 的脚本（有脚本的 skill 才可用）
+Progressive disclosure 模式（通过 SkillMiddleware 实现）：
+1. SkillMiddleware         — 动态注入 skill 摘要到 system prompt（省去 list 工具调用）
+2. load_skill              — 按需加载指定 skill 的完整 SKILL.md，同时标记画布节点为执行中
+3. report_execution_plan   — 上报执行计划到画布
+4. mark_skill_done         — 标记 skill 执行完成/失败
+5. delegate_to_subagent    — 委托 sub-agent 执行特定 skill
 """
 
 from __future__ import annotations
 
-import asyncio
 import json
-import logging
-import os
-import sys
 from dataclasses import dataclass, field
-from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 from langchain.tools import tool, ToolRuntime
+from loguru import logger
 
-from backend.app.config import SKILLS_DIR, TMP_DIR
+from backend.app.config import TMP_DIR
 
 if TYPE_CHECKING:
     from backend.app.core.skill_registry import SkillRegistry
     from backend.app.core.session_manager import SessionManager
-
-logger = logging.getLogger(__name__)
-
-DEFAULT_SCRIPT_TIMEOUT = 300  # 秒
+    from backend.app.core.subagent import SubAgentExecutor
 
 
 @dataclass
@@ -38,13 +33,14 @@ class SessionContext:
     session_type: str = "interactive"   # "interactive" | "batch"
     external_ref: str | None = None
     current_node_id: str | None = None  # 当前执行的 workflow 节点 ID
-    workflow_skill_ids: list[str] = field(default_factory=list)  # 原始 workflow 中的 skill ID 列表
+    workflow_skill_ids: list[str] = field(default_factory=list)
 
 
 # ── 全局引用（在 build_skill_tools 中注入）──────────────────
 
 _registry: SkillRegistry | None = None
 _session_manager: SessionManager | None = None
+_subagent_executor: SubAgentExecutor | None = None
 
 
 def _get_registry() -> SkillRegistry:
@@ -56,65 +52,45 @@ def _get_registry() -> SkillRegistry:
 # ── Tools ────────────────────────────────────────────────────────────
 
 @tool
-def list_available_skills(runtime: ToolRuntime[SessionContext]) -> str:
-    """List all available skills with their ID, name, category and description.
+def load_skill(skill_id: str, runtime: ToolRuntime[SessionContext]) -> str:
+    """Load a specialized skill prompt and context.
 
-    Call this first to discover what capabilities are available before planning
-    how to accomplish a task.
-    """
-    registry = _get_registry()
-    summaries = registry.get_all_summaries()
+    Always call this before executing a skill. Returns the skill's full
+    documentation (SKILL.md) including parameters, usage instructions, and
+    expected behavior.
 
-    if not summaries:
-        return "当前没有可用的 Skill。"
-
-    lines = ["可用 Skills 列表：\n"]
-    by_category: dict[str, list] = {}
-    for s in summaries:
-        by_category.setdefault(s.category, []).append(s)
-
-    for category, skills in sorted(by_category.items()):
-        lines.append(f"【{category}】")
-        for s in skills:
-            script_tag = " [有脚本]" if s.has_script else " [纯推理]"
-            lines.append(f"  - {s.id}: {s.name}{script_tag}")
-            if s.description:
-                lines.append(f"    {s.description}")
-        lines.append("")
-
-    return "\n".join(lines)
-
-
-@tool
-def load_skill_docs(skill_id: str, runtime: ToolRuntime[SessionContext]) -> str:
-    """Load full documentation (SKILL.md) for a specific skill.
-
-    Always call this before executing a skill to understand its parameters,
-    inputs, outputs and expected behavior.
+    Side effect: marks the skill as "running" on the canvas (blue highlight).
 
     Args:
-        skill_id: The skill ID as returned by list_available_skills
+        skill_id: The skill ID as shown in the Available Skills list in the system prompt
     """
     registry = _get_registry()
     skill = registry.get_skill(skill_id)
 
     if not skill:
         available = [s.id for s in registry.get_all_summaries()]
+        logger.warning(f"[load_skill] NOT FOUND: {skill_id}")
         return (
             f"Skill '{skill_id}' 不存在。\n"
             f"可用的 Skill ID: {', '.join(available[:20])}"
         )
 
+    session_id = runtime.context.session_id if runtime and runtime.context else "?"
+    logger.info(f"[load_skill] {skill_id}  session={session_id}")
+    _emit_skill_event(runtime, skill_id, "skill_start", f"开始执行: {skill_id}")
+
     parts = [
         f"# {skill.name} ({skill.id})",
         f"分类: {skill.category}",
         f"描述: {skill.description}",
-        f"有脚本: {'是' if skill.has_script else '否'}",
-        "",
     ]
 
+    if skill.preferred_model:
+        parts.append(f"推荐模型: {skill.preferred_model}（建议使用 delegate_to_subagent 委托执行）")
+
+    parts.append("")
+
     if skill.skill_md_content:
-        parts.append("## 完整文档")
         parts.append(skill.skill_md_content)
 
     return "\n".join(parts)
@@ -151,7 +127,6 @@ def report_execution_plan(
     except (json.JSONDecodeError, ValueError):
         parsed_steps = [{"skill_id": steps.strip(), "label": steps.strip()}]
 
-    # Normalize each step
     normalized: list[dict] = []
     for item in parsed_steps:
         if isinstance(item, dict):
@@ -170,175 +145,112 @@ def report_execution_plan(
     ))
 
     step_names = ", ".join(s["label"] for s in normalized)
+    logger.info(f"[plan] {len(normalized)} steps: {step_names}  session={session_id}")
     return f"执行计划已上报，共 {len(normalized)} 个步骤：{step_names}。现在开始逐步执行。"
 
 
 @tool
-async def run_skill_script(
+def mark_skill_done(
     skill_id: str,
-    arguments: str,
-    runtime: ToolRuntime[SessionContext],
+    success: bool = True,
+    detail: str = "",
+    runtime: ToolRuntime[SessionContext] = None,
 ) -> str:
-    """Execute a skill's processing script with JSON arguments.
+    """Mark a skill as completed on the canvas.
 
-    Only available for skills that have scripts (has_script=True).
-    Always call load_skill_docs first to understand the required arguments.
+    Call this after you finish executing a skill. The canvas node will update
+    to show a green checkmark (success) or red cross (failure).
 
     Args:
-        skill_id: The skill ID to execute
-        arguments: JSON string containing the parameters for the script.
-                   Example: '{"input_path": "/path/to/video.mp4"}'
+        skill_id: The skill ID that finished executing
+        success: Whether the execution was successful (default True)
+        detail: Optional short summary of the result
     """
+    if success:
+        logger.info(f"[skill] ✓ {skill_id}{('  ' + detail) if detail else ''}")
+        _emit_skill_event(runtime, skill_id, "skill_end", detail or f"执行完成: {skill_id}")
+        return f"已标记 skill '{skill_id}' 完成。"
+    else:
+        logger.warning(f"[skill] ✗ {skill_id}{('  ' + detail) if detail else ''}")
+        _emit_skill_event(runtime, skill_id, "skill_error", detail or f"执行失败: {skill_id}")
+        return f"已标记 skill '{skill_id}' 失败。"
+
+
+@tool
+async def delegate_to_subagent(
+    skill_id: str,
+    instruction: str,
+    model_profile: str = "",
+    runtime: ToolRuntime[SessionContext] = None,
+) -> str:
+    """Delegate a skill to a sub-agent that uses a different LLM model.
+
+    Use this when a skill has a preferred_model configured, or when you want
+    to leverage a specific model's strengths for a particular task. The
+    sub-agent runs independently with its own model and returns the result.
+
+    This automatically marks the skill as completed on the canvas.
+
+    Args:
+        skill_id: The skill ID to delegate (must exist in the registry)
+        instruction: Detailed instruction for the sub-agent — include all
+                     context it needs: input file paths, expected output,
+                     specific requirements. The sub-agent has NO access to
+                     your conversation history.
+        model_profile: LLM profile name to use. If empty, uses the skill's
+                       preferred_model from its SKILL.md frontmatter.
+    """
+    if _subagent_executor is None:
+        return json.dumps({"success": False, "error": "SubAgentExecutor 未初始化"})
+
     registry = _get_registry()
     skill = registry.get_skill(skill_id)
-
     if not skill:
         return json.dumps({"success": False, "error": f"Skill '{skill_id}' 不存在"})
 
-    if not skill.has_script:
+    profile = model_profile.strip() if model_profile else None
+    if not profile:
+        profile = skill.preferred_model
+    if not profile:
         return json.dumps({
             "success": False,
-            "error": f"Skill '{skill_id}' 没有可执行脚本，请通过理解其 SKILL.md 文档直接推理执行。"
+            "error": (
+                f"未指定 model_profile，且 skill '{skill_id}' 没有配置 preferred_model。"
+                "请通过 model_profile 参数指定，或自行推理执行。"
+            ),
         })
 
-    script_path = Path(skill.script_path) if skill.script_path else (
-        SKILLS_DIR / skill_id / "scripts" / "run.py"
+    session_id = runtime.context.session_id if runtime and runtime.context else ""
+    logger.info(f"[subagent] → {skill_id}  profile={profile}  session={session_id}")
+
+    result_text = await _subagent_executor.execute(
+        skill_id=skill_id,
+        profile_name=profile,
+        task_instruction=instruction,
+        session_id=session_id,
     )
 
-    if not script_path.exists():
-        return json.dumps({
-            "success": False,
-            "error": f"脚本文件不存在: {script_path}"
-        })
+    _emit_skill_event(runtime, skill_id, "skill_end", f"Sub-agent 执行完成: {skill_id}")
 
-    # 解析参数
-    try:
-        args_dict = json.loads(arguments) if arguments.strip() else {}
-    except json.JSONDecodeError:
-        args_dict = {"input": arguments}
-
-    # 构建命令
-    cmd = [sys.executable, str(script_path)]
-    env = os.environ.copy()
-    env["SKILL_ARGUMENTS"] = json.dumps(args_dict)
-    env["SESSION_ID"] = runtime.context.session_id if runtime.context else ""
-    env["SKILL_TMP_DIR"] = str(TMP_DIR)
-
-    for key, value in args_dict.items():
-        if isinstance(value, (str, int, float, bool)):
-            cmd.extend([f"--{key}", str(value)])
-
-    logger.info(f"[{skill_id}] 执行脚本: {script_path}")
-    logger.info(f"[{skill_id}] 参数: {arguments[:200]}")
-
-    _emit_skill_event(runtime, skill_id, "skill_start", f"开始执行: {skill_id}")
-
-    try:
-        process = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            env=env,
-            cwd=str(script_path.parent),
-        )
-
-        try:
-            stdout, stderr = await asyncio.wait_for(
-                process.communicate(),
-                timeout=DEFAULT_SCRIPT_TIMEOUT,
-            )
-        except asyncio.TimeoutError:
-            process.kill()
-            await process.wait()
-            _emit_skill_event(runtime, skill_id, "skill_error", f"脚本执行超时（>{DEFAULT_SCRIPT_TIMEOUT}s）")
-            return json.dumps({
-                "success": False,
-                "error": f"脚本执行超时（>{DEFAULT_SCRIPT_TIMEOUT}s）: {script_path}"
-            })
-
-        stdout_text = stdout.decode("utf-8", errors="replace").strip()
-        stderr_text = stderr.decode("utf-8", errors="replace").strip()
-
-        if process.returncode != 0:
-            _emit_skill_event(runtime, skill_id, "skill_error", f"脚本退出码 {process.returncode}")
-            return json.dumps({
-                "success": False,
-                "error": f"脚本退出码 {process.returncode}",
-                "stderr": stderr_text[:2000],
-            })
-
-        try:
-            result = json.loads(stdout_text)
-        except json.JSONDecodeError:
-            result = {
-                "success": True,
-                "output": stdout_text[:5000],
-                "stderr": stderr_text[:1000] if stderr_text else None,
-            }
-
-        _try_register_artifacts(result, skill_id, runtime)
-        _emit_skill_event(runtime, skill_id, "skill_end", f"执行完成: {skill_id}")
-        return json.dumps(result, ensure_ascii=False)
-
-    except FileNotFoundError:
-        _emit_skill_event(runtime, skill_id, "skill_error", "Python 解释器或脚本未找到")
-        return json.dumps({"success": False, "error": "Python 解释器或脚本未找到"})
-    except Exception as e:
-        _emit_skill_event(runtime, skill_id, "skill_error", str(e))
-        return json.dumps({"success": False, "error": str(e)})
+    return json.dumps({
+        "success": True,
+        "skill_id": skill_id,
+        "model_profile": profile,
+        "result": result_text,
+    }, ensure_ascii=False)
 
 
-_ARTIFACT_PATH_KEYS = {"output_path", "result_path", "video_path", "audio_path", "srt_path", "image_path", "file_path"}
-_MEDIA_EXT_MAP = {
-    ".mp4": "video/mp4", ".mov": "video/quicktime", ".webm": "video/webm",
-    ".mp3": "audio/mpeg", ".wav": "audio/wav", ".aac": "audio/aac",
-    ".srt": "text/srt", ".json": "application/json",
-    ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png",
-}
-
-
-def _try_register_artifacts(result: dict, skill_id: str, runtime: ToolRuntime[SessionContext]) -> None:
-    """Inspect script result for file paths and register them as session artifacts."""
-    if _session_manager is None or not runtime.context:
-        return
-    session_id = runtime.context.session_id
-    if not session_id:
-        return
-
-    node_id = runtime.context.current_node_id
-
-    for key, value in result.items():
-        if key not in _ARTIFACT_PATH_KEYS or not isinstance(value, str):
-            continue
-        path = Path(value)
-        if not path.exists():
-            continue
-        ext = path.suffix.lower()
-        media_type = _MEDIA_EXT_MAP.get(ext, "")
-        artifact_key = f"{skill_id}_{key}" if not node_id else f"{node_id}_{skill_id}_{key}"
-        try:
-            _session_manager.register_artifact(
-                session_id=session_id,
-                key=artifact_key,
-                file_path=str(path),
-                media_type=media_type,
-                node_id=node_id,
-                skill_id=skill_id,
-            )
-            logger.info(f"[{skill_id}] 已注册产物: {artifact_key} -> {path}")
-        except Exception as e:
-            logger.warning(f"[{skill_id}] 注册产物失败: {e}")
-
+# ── Internal helpers ─────────────────────────────────────────────────
 
 def _emit_skill_event(
-    runtime: ToolRuntime[SessionContext],
+    runtime: ToolRuntime[SessionContext] | None,
     skill_id: str,
     event_type: str,
     detail: str,
     extra: dict | None = None,
 ) -> None:
     """向 SessionManager 事件总线发布 skill 执行事件。"""
-    if _session_manager is None or not runtime.context:
+    if _session_manager is None or not runtime or not runtime.context:
         return
     session_id = runtime.context.session_id
     if not session_id:
@@ -368,13 +280,28 @@ def _emit_skill_event(
 # ── Builder ──────────────────────────────────────────────────────────
 
 def build_skill_tools(registry: SkillRegistry) -> list:
-    """注入 registry 并返回所有 skill-related tools。"""
+    """注入 registry 并返回所有 skill-related tools。
+
+    注意：skill 发现（摘要列表）由 SkillMiddleware 动态注入到 system prompt，
+    不再需要 list_available_skills 工具。
+    """
     global _registry
     _registry = registry
-    return [list_available_skills, load_skill_docs, run_skill_script, report_execution_plan]
+    return [
+        load_skill,
+        report_execution_plan,
+        mark_skill_done,
+        delegate_to_subagent,
+    ]
 
 
 def inject_session_manager(session_manager: SessionManager) -> None:
     """后置注入 SessionManager（因为启动顺序晚于 Orchestrator）。"""
     global _session_manager
     _session_manager = session_manager
+
+
+def inject_subagent_executor(executor: SubAgentExecutor) -> None:
+    """后置注入 SubAgentExecutor。"""
+    global _subagent_executor
+    _subagent_executor = executor

@@ -7,7 +7,7 @@ from __future__ import annotations
 
 from collections import defaultdict, deque
 
-from backend.app.models.workflow import Workflow, WorkflowNode
+from backend.app.models.workflow import Workflow
 
 
 class WorkflowEngine:
@@ -73,25 +73,3 @@ class WorkflowEngine:
 
         return sorted_nodes
 
-    def get_upstream_nodes(self, workflow: Workflow, node_id: str) -> list[str]:
-        """获取指定节点的直接上游节点 ID 列表。"""
-        return [e.source_node_id for e in workflow.edges if e.target_node_id == node_id]
-
-    def get_downstream_nodes(self, workflow: Workflow, node_id: str) -> list[str]:
-        """获取指定节点的直接下游节点 ID 列表。"""
-        return [e.target_node_id for e in workflow.edges if e.source_node_id == node_id]
-
-    def get_all_downstream_nodes(self, workflow: Workflow, node_id: str) -> set[str]:
-        """获取指定节点的所有下游节点（递归，包括间接下游）。"""
-        all_downstream: set[str] = set()
-        queue: deque[str] = deque([node_id])
-        while queue:
-            current = queue.popleft()
-            for ds in self.get_downstream_nodes(workflow, current):
-                if ds not in all_downstream:
-                    all_downstream.add(ds)
-                    queue.append(ds)
-        return all_downstream
-
-    def _build_node_map(self, workflow: Workflow) -> dict[str, WorkflowNode]:
-        return {node.node_id: node for node in workflow.nodes}

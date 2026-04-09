@@ -1,9 +1,14 @@
 """Application configuration management."""
 
+from __future__ import annotations
+
+from loguru import logger
+import json
 from dataclasses import dataclass, field
 from pathlib import Path
 from dotenv import load_dotenv
 import os
+
 
 
 # Load .env from project root
@@ -102,6 +107,45 @@ class LLMConfig:
 
 
 @dataclass
+class LLMProfileConfig:
+    """单个 LLM Sub-agent Profile 配置"""
+    api_key: str = ""
+    base_url: str = ""
+    model: str = ""
+
+    @property
+    def is_configured(self) -> bool:
+        return bool(self.api_key)
+
+
+def _parse_llm_profiles() -> dict[str, LLMProfileConfig]:
+    """从 LLM_PROFILES 环境变量解析多模型配置。
+
+    格式: JSON object, key=profile 名称, value={"api_key", "base_url", "model"}
+    示例: LLM_PROFILES='{"gemini-3.1":{"api_key":"xxx","base_url":"https://...","model":"gemini-3.1-pro"}}'
+    """
+    raw = os.getenv("LLM_PROFILES", "")
+    if not raw:
+        return {}
+
+    try:
+        profiles_data = json.loads(raw)
+    except json.JSONDecodeError:
+        logger.warning("LLM_PROFILES 环境变量 JSON 解析失败，忽略")
+        return {}
+
+    profiles: dict[str, LLMProfileConfig] = {}
+    for name, cfg in profiles_data.items():
+        if isinstance(cfg, dict):
+            profiles[name] = LLMProfileConfig(
+                api_key=cfg.get("api_key", ""),
+                base_url=cfg.get("base_url", ""),
+                model=cfg.get("model", ""),
+            )
+    return profiles
+
+
+@dataclass
 class Settings:
     """应用配置集合"""
     volcengine_asr: VolcengineASRConfig = field(default_factory=VolcengineASRConfig)
@@ -109,6 +153,7 @@ class Settings:
     aliyun_oss: AliyunOSSConfig = field(default_factory=AliyunOSSConfig)
     aliyun_ice: AliyunICEConfig = field(default_factory=AliyunICEConfig)
     llm: LLMConfig = field(default_factory=LLMConfig)
+    llm_profiles: dict[str, LLMProfileConfig] = field(default_factory=_parse_llm_profiles)
 
 
 # 全局单例

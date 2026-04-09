@@ -11,16 +11,15 @@ from __future__ import annotations
 
 import asyncio
 import json
-import logging
 import os
+import time
 import urllib.request
 from pathlib import Path
 
 from langchain.tools import tool, ToolRuntime
+from loguru import logger
 
 from .skill_tools import SessionContext
-
-logger = logging.getLogger(__name__)
 
 BASH_TIMEOUT = 120  # 秒
 MAX_OUTPUT_CHARS = 8000
@@ -36,7 +35,8 @@ async def run_bash(command: str, runtime: ToolRuntime[SessionContext]) -> str:
     Args:
         command: The shell command to execute
     """
-    logger.info(f"[bash] {command[:200]}")
+    logger.info(f"[bash] $ {command[:150]}")
+    t0 = time.monotonic()
 
     try:
         process = await asyncio.create_subprocess_shell(
@@ -53,6 +53,7 @@ async def run_bash(command: str, runtime: ToolRuntime[SessionContext]) -> str:
         except asyncio.TimeoutError:
             process.kill()
             await process.wait()
+            logger.warning(f"[bash] TIMEOUT after {BASH_TIMEOUT}s — {command[:80]}")
             return json.dumps({
                 "success": False,
                 "error": f"命令超时（>{BASH_TIMEOUT}s）",
@@ -62,6 +63,13 @@ async def run_bash(command: str, runtime: ToolRuntime[SessionContext]) -> str:
         stdout_text = stdout.decode("utf-8", errors="replace").strip()
         stderr_text = stderr.decode("utf-8", errors="replace").strip()
         success = process.returncode == 0
+        elapsed = time.monotonic() - t0
+
+        if success:
+            logger.info(f"[bash] rc=0 ({elapsed:.1f}s)")
+        else:
+            hint = stderr_text[:120].replace("\n", " ") if stderr_text else "(no stderr)"
+            logger.warning(f"[bash] rc={process.returncode} ({elapsed:.1f}s) — {hint}")
 
         result: dict = {
             "success": success,
@@ -75,6 +83,7 @@ async def run_bash(command: str, runtime: ToolRuntime[SessionContext]) -> str:
         return json.dumps(result, ensure_ascii=False)
 
     except Exception as e:
+        logger.error(f"[bash] ERROR: {e}")
         return json.dumps({"success": False, "error": str(e)})
 
 
@@ -90,26 +99,32 @@ def read_file(file_path: str, runtime: ToolRuntime[SessionContext]) -> str:
     path = Path(file_path)
 
     if not path.exists():
+        logger.warning(f"[read_file] NOT FOUND: {file_path}")
         return json.dumps({"success": False, "error": f"文件不存在: {file_path}"})
 
     if not path.is_file():
+        logger.warning(f"[read_file] NOT A FILE: {file_path}")
         return json.dumps({"success": False, "error": f"路径不是文件: {file_path}"})
 
     try:
         size = path.stat().st_size
         if size > 5 * 1024 * 1024:  # 5MB limit
+            logger.warning(f"[read_file] TOO LARGE ({size // 1024} KB): {file_path}")
             return json.dumps({
                 "success": False,
                 "error": f"文件过大（{size // 1024}KB），请使用 run_bash 分段读取"
             })
 
         content = path.read_text(encoding="utf-8", errors="replace")
-        if len(content) > MAX_OUTPUT_CHARS:
+        truncated = len(content) > MAX_OUTPUT_CHARS
+        if truncated:
             content = content[:MAX_OUTPUT_CHARS] + f"\n...[内容已截断，共 {len(content)} 字符]"
 
+        logger.info(f"[read_file] {path.name}  {size // 1024} KB{' (truncated)' if truncated else ''}")
         return json.dumps({"success": True, "content": content, "size": size}, ensure_ascii=False)
 
     except Exception as e:
+        logger.error(f"[read_file] ERROR {file_path}: {e}")
         return json.dumps({"success": False, "error": str(e)})
 
 
@@ -128,12 +143,14 @@ def write_file(file_path: str, content: str, runtime: ToolRuntime[SessionContext
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(content, encoding="utf-8")
+        logger.info(f"[write_file] {path.name}  {len(content)} chars")
         return json.dumps({
             "success": True,
             "file_path": str(path),
             "size": len(content),
         })
     except Exception as e:
+        logger.error(f"[write_file] ERROR {file_path}: {e}")
         return json.dumps({"success": False, "error": str(e)})
 
 
@@ -150,6 +167,7 @@ async def download_file(
         save_path: Local absolute path to save the file
     """
     path = Path(save_path)
+    logger.info(f"[download] {url[:80]} → {path.name}")
 
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -158,6 +176,7 @@ async def download_file(
         await loop.run_in_executor(None, _download_sync, url, path)
 
         size = path.stat().st_size
+        logger.info(f"[download] OK  {path.name}  {size // 1024} KB")
         return json.dumps({
             "success": True,
             "file_path": str(path),
@@ -165,6 +184,7 @@ async def download_file(
             "url": url,
         })
     except Exception as e:
+        logger.error(f"[download] ERROR {url[:80]}: {e}")
         return json.dumps({"success": False, "error": str(e), "url": url})
 
 

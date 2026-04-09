@@ -6,14 +6,13 @@
 
 from __future__ import annotations
 
-import logging
 
+from loguru import logger
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel, Field
 
 from backend.app.models.session import SessionType
 
-logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/executions", tags=["executions"])
 

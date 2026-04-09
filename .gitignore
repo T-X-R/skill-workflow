@@ -12,6 +12,7 @@ wheels/
 # Environment variables (contain API keys and secrets)
 .env
 .env.*
+!.env.example
 
 # Runtime data
 backend/data/

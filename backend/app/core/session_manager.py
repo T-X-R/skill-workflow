@@ -12,23 +12,22 @@
 from __future__ import annotations
 
 import asyncio
-import logging
 import uuid
 from collections import defaultdict
 from datetime import datetime, timedelta
 from typing import TYPE_CHECKING, Any, AsyncGenerator, Callable
 
+from loguru import logger
+
 from backend.app.config import MAX_CONCURRENT_BATCH, SESSION_TTL_HOURS
 from backend.app.models.session import (
-    Session, SessionCreate, SessionType, Artifact, ExecutionEvent,
+    Session, SessionCreate, SessionType, ExecutionEvent,
 )
 
 if TYPE_CHECKING:
     from backend.app.core.orchestrator import Orchestrator
     from backend.app.models.workflow import Workflow
     from backend.app.storage.local_store import LocalStore
-
-logger = logging.getLogger(__name__)
 
 EventCallback = Callable[[str, ExecutionEvent], Any]  # (session_id, event) -> ...
 
@@ -51,8 +50,6 @@ class SessionManager:
 
         # P4: 事件总线 — session_id → list[callback]
         self._event_subscribers: dict[str, list[EventCallback]] = defaultdict(list)
-        # 全局订阅（用于监控/日志）
-        self._global_subscribers: list[EventCallback] = []
 
         # TTL 清理任务
         self._cleanup_task: asyncio.Task | None = None
@@ -125,9 +122,6 @@ class SessionManager:
         if not cbs:
             self._event_subscribers.pop(session_id, None)
 
-    def subscribe_global(self, callback: EventCallback) -> None:
-        self._global_subscribers.append(callback)
-
     def broadcast_transient_event(self, session_id: str, event: ExecutionEvent) -> None:
         """广播瞬态事件：仅通知订阅者，不写入 execution_log（用于高频文本流）。"""
         for cb in self._event_subscribers.get(session_id, []):
@@ -135,12 +129,6 @@ class SessionManager:
                 cb(session_id, event)
             except Exception as e:
                 logger.warning(f"瞬态事件回调异常: {e}")
-
-        for cb in self._global_subscribers:
-            try:
-                cb(session_id, event)
-            except Exception as e:
-                logger.warning(f"全局瞬态事件回调异常: {e}")
 
     def emit_event(self, session_id: str, event: ExecutionEvent) -> None:
         """发布执行事件：写入 session.execution_log 并通知订阅者。"""
@@ -154,12 +142,6 @@ class SessionManager:
                 cb(session_id, event)
             except Exception as e:
                 logger.warning(f"事件回调异常: {e}")
-
-        for cb in self._global_subscribers:
-            try:
-                cb(session_id, event)
-            except Exception as e:
-                logger.warning(f"全局事件回调异常: {e}")
 
     # ── Messaging ─────────────────────────────────────────────────────
 
@@ -300,51 +282,6 @@ class SessionManager:
                 except Exception:
                     pass
 
-    # ── Artifact Management ───────────────────────────────────────────
-
-    def register_artifact(
-        self,
-        session_id: str,
-        key: str,
-        file_path: str,
-        media_type: str = "",
-        node_id: str | None = None,
-        skill_id: str | None = None,
-    ) -> Artifact | None:
-        session = self.get_session(session_id)
-        if not session:
-            return None
-
-        existing = session.artifacts.get(key)
-        version = (existing.version + 1) if existing else 1
-
-        artifact = Artifact(
-            key=key,
-            file_path=file_path,
-            media_type=media_type,
-            node_id=node_id,
-            skill_id=skill_id,
-            version=version,
-        )
-        session.artifacts[key] = artifact
-
-        self.emit_event(session_id, ExecutionEvent(
-            event_type="artifact_registered",
-            node_id=node_id,
-            skill_id=skill_id,
-            detail=f"产物已注册: {key} (v{version})",
-            extra={"file_path": file_path, "media_type": media_type, "version": version},
-        ))
-
-        self._save_session(session)
-        return artifact
-
-    def get_artifacts(self, session_id: str) -> dict[str, Artifact]:
-        session = self.get_session(session_id)
-        if not session:
-            return {}
-        return session.artifacts
-
     # ── Batch Status ─────────────────────────────────────────────────
 
     def get_batch_status(self) -> dict:
@@ -410,6 +347,3 @@ class SessionManager:
                     pass
         self._active_tasks.clear()
 
-    def is_active(self, session_id: str) -> bool:
-        task = self._active_tasks.get(session_id)
-        return task is not None and not task.done()

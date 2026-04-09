@@ -6,9 +6,9 @@
 
 from __future__ import annotations
 
+from loguru import logger
 import asyncio
 import json
-import logging
 
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import StreamingResponse
@@ -16,7 +16,6 @@ from pydantic import BaseModel, Field
 
 from backend.app.models.session import Session, SessionCreate
 
-logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/sessions", tags=["sessions"])
 

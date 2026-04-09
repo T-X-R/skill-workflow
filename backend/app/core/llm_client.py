@@ -3,15 +3,10 @@
 支持 OpenAI 和火山引擎 Ark（通过 OpenAI 兼容 API）
 """
 
-import logging
-from typing import AsyncGenerator
-
 from langchain_openai import ChatOpenAI
-from langchain_core.messages import SystemMessage, HumanMessage, AIMessage
+from loguru import logger
 
-from backend.app.config import settings, LLMConfig
-
-logger = logging.getLogger(__name__)
+from backend.app.config import settings, LLMConfig, LLMProfileConfig
 
 
 # === 自定义异常 ===
@@ -46,6 +41,7 @@ class LLMClient:
         self.config = config
         self.model = self._init_model(config)
         self.provider_name = self._get_provider_name(config)
+        self._profile_cache: dict[str, ChatOpenAI] = {}
         logger.info(f"LLMClient 初始化完成，使用 {self.provider_name}")
 
     def _init_model(self, config: LLMConfig) -> ChatOpenAI:
@@ -74,75 +70,41 @@ class LLMClient:
             return f"OpenAI ({config.model or 'gpt-4o'})"
         return f"Volcengine Ark ({config.ark_endpoint_id})"
 
-    async def chat(self, messages: list, **kwargs) -> str:
-        """统一聊天接口
-        
-        Args:
-            messages: 消息列表，支持两种格式：
-                - LangChain Message 对象列表
-                - OpenAI 格式 dict 列表 [{"role": "system", "content": "..."}]
-            **kwargs: 传递给模型的额外参数
-            
-        Returns:
-            LLM 回复的文本内容
-        """
-        try:
-            lc_messages = self._normalize_messages(messages)
-            response = await self.model.ainvoke(lc_messages, **kwargs)
-            return response.content
-        except Exception as e:
-            logger.error(f"LLM 调用失败: {e}")
-            raise LLMAPIError(f"LLM 调用失败: {e}") from e
-
-    async def chat_stream(self, messages: list, **kwargs) -> AsyncGenerator[str, None]:
-        """流式聊天接口
-        
-        Args:
-            messages: 消息列表（同 chat()）
-            **kwargs: 传递给模型的额外参数
-            
-        Yields:
-            LLM 回复的文本 chunk
-        """
-        try:
-            lc_messages = self._normalize_messages(messages)
-            async for chunk in self.model.astream(lc_messages, **kwargs):
-                if chunk.content:
-                    yield chunk.content
-        except Exception as e:
-            logger.error(f"LLM 流式调用失败: {e}")
-            raise LLMAPIError(f"LLM 流式调用失败: {e}") from e
-
     def get_model(self) -> ChatOpenAI:
-        """获取底层 LangChain ChatModel 实例
+        """获取底层 LangChain ChatModel 实例（主模型）
         
         用于 create_agent() 等需要直接使用模型的场景。
         """
         return self.model
 
-    def _normalize_messages(self, messages: list) -> list:
-        """将消息标准化为 LangChain Message 对象
-        
-        支持两种输入格式：
-        1. 已经是 LangChain Message 对象 → 直接返回
-        2. OpenAI 格式 dict → 转换为 LangChain Message
+    def get_model_for_profile(self, profile_name: str) -> ChatOpenAI | None:
+        """获取指定 profile 的模型实例（带缓存）。
+
+        Returns:
+            ChatOpenAI 实例，如果 profile 不存在或未配置则返回 None
         """
-        if not messages:
-            return []
-        
-        # 已经是 LangChain Message 对象
-        if hasattr(messages[0], 'content') and not isinstance(messages[0], dict):
-            return messages
-        
-        # OpenAI 格式 dict → LangChain Message
-        result = []
-        for msg in messages:
-            role = msg.get("role", "user")
-            content = msg.get("content", "")
-            if role == "system":
-                result.append(SystemMessage(content=content))
-            elif role == "assistant":
-                result.append(AIMessage(content=content))
-            else:
-                result.append(HumanMessage(content=content))
-        return result
+        if profile_name in self._profile_cache:
+            return self._profile_cache[profile_name]
+
+        profile = settings.llm_profiles.get(profile_name)
+        if not profile or not profile.is_configured:
+            return None
+
+        model = ChatOpenAI(
+            model=profile.model or None,
+            api_key=profile.api_key,
+            base_url=profile.base_url or None,
+            max_retries=3,
+            request_timeout=180,
+        )
+        self._profile_cache[profile_name] = model
+        logger.info(f"已创建 LLM profile '{profile_name}' 模型实例 ({profile.model})")
+        return model
+
+    def get_available_profiles(self) -> list[str]:
+        """返回所有已配置的 profile 名称列表"""
+        return [
+            name for name, cfg in settings.llm_profiles.items()
+            if cfg.is_configured
+        ]
+

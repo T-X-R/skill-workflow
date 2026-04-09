@@ -29,4 +29,5 @@ dependencies = [
     "aiosqlite>=0.22.1",
     "uvicorn[standard]>=0.36.0",
     "websockets>=16.0",
+    "loguru>=0.7.3",
 ]

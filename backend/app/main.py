@@ -6,11 +6,12 @@
 - 应用启动时初始化所有核心组件
 """
 
-import logging
 from contextlib import asynccontextmanager
 
+from loguru import logger
+
 import aiosqlite
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, WebSocket
 from fastapi.middleware.cors import CORSMiddleware
 from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 
@@ -20,17 +21,15 @@ from backend.app.core.skill_registry import SkillRegistry
 from backend.app.core.llm_client import LLMClient
 from backend.app.core.orchestrator import Orchestrator
 from backend.app.core.session_manager import SessionManager
-from backend.app.tools import inject_session_manager
+from backend.app.core.subagent import SubAgentExecutor
+from backend.app.tools import inject_session_manager, inject_subagent_executor
 
 from backend.app.api import skills, workflows, executions
 from backend.app.api.sessions import router as sessions_router
 from backend.app.ws.execution_ws import execution_websocket
+from backend.app.logging_config import setup_logging
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
-)
-logger = logging.getLogger(__name__)
+setup_logging()
 
 
 @asynccontextmanager
@@ -88,6 +87,15 @@ async def lifespan(app: FastAPI):
     )
     app.state.orchestrator = orchestrator
     logger.info("Orchestrator 初始化完成")
+
+    # SubAgentExecutor（sub-agent 委托执行器）
+    subagent_executor = SubAgentExecutor(registry=registry, llm_client=llm_client)
+    app.state.subagent_executor = subagent_executor
+    inject_subagent_executor(subagent_executor)
+    logger.info(
+        f"SubAgentExecutor 初始化完成，可用 profiles: "
+        f"{llm_client.get_available_profiles() or ['无（未配置 LLM_PROFILES）']}"
+    )
 
     # SessionManager（含并发控制 + 事件总线 + TTL 清理）
     session_manager = SessionManager(store=store, orchestrator=orchestrator)

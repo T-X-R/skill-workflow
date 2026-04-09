@@ -32,6 +32,7 @@ class SkillMeta(BaseModel):
     params: list[SkillParam] = Field(default_factory=list)
     has_script: bool = Field(default=False, description="是否有可执行脚本")
     script_path: str | None = Field(default=None, description="脚本路径")
+    preferred_model: str | None = Field(default=None, description="推荐使用的 LLM profile 名称，设置后可委托给 sub-agent 执行")
     skill_md_content: str = Field(default="", description="完整 SKILL.md 原文")
 
 
@@ -42,6 +43,7 @@ class SkillSummary(BaseModel):
     description: str
     category: str
     has_script: bool = False
+    preferred_model: str | None = None
 
     @classmethod
     def from_meta(cls, meta: SkillMeta) -> "SkillSummary":
@@ -52,4 +54,5 @@ class SkillSummary(BaseModel):
             description=meta.description,
             category=meta.category,
             has_script=meta.has_script,
+            preferred_model=meta.preferred_model,
         )

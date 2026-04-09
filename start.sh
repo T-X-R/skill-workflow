@@ -22,10 +22,13 @@ NC='\033[0m'
 cleanup() {
     echo ""
     echo -e "${YELLOW}正在关闭服务...${NC}"
+    # 杀掉整个进程组，确保 uvicorn reloader/server 子进程一并退出
     if [ -n "$BACKEND_PID" ] && kill -0 "$BACKEND_PID" 2>/dev/null; then
-        kill "$BACKEND_PID" 2>/dev/null
-        echo -e "${GREEN}  ✓ 后端已停止${NC}"
+        kill -- -"$(ps -o pgid= -p "$BACKEND_PID" 2>/dev/null | tr -d ' ')" 2>/dev/null || kill "$BACKEND_PID" 2>/dev/null
     fi
+    # 兜底：直接释放端口
+    lsof -ti :8000 2>/dev/null | xargs kill -9 2>/dev/null || true
+    echo -e "${GREEN}  ✓ 后端已停止${NC}"
     if [ -n "$FRONTEND_PID" ] && kill -0 "$FRONTEND_PID" 2>/dev/null; then
         kill "$FRONTEND_PID" 2>/dev/null
         echo -e "${GREEN}  ✓ 前端已停止${NC}"
@@ -90,6 +93,14 @@ echo -e "${GREEN}  ✓ 前端依赖就绪${NC}"
 # ---- 启动后端 ----
 echo ""
 echo -e "${YELLOW}[3/4] 启动后端服务...${NC}"
+
+# 清理占用 8000 端口的旧进程
+EXISTING_PID=$(lsof -ti :8000 2>/dev/null || true)
+if [ -n "$EXISTING_PID" ]; then
+    echo -e "${YELLOW}  ⚠ 端口 8000 被进程 $EXISTING_PID 占用，正在释放...${NC}"
+    kill -9 $EXISTING_PID 2>/dev/null
+    sleep 1
+fi
 
 cd "$PROJECT_DIR"
 if command -v uv &>/dev/null; then

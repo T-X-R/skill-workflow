@@ -9,13 +9,12 @@
 
 from __future__ import annotations
 
+from loguru import logger
 import asyncio
 import json
-import logging
 
 from fastapi import WebSocket, WebSocketDisconnect
 
-logger = logging.getLogger(__name__)
 
 
 async def execution_websocket(websocket: WebSocket, execution_id: str):

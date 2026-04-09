@@ -3,7 +3,7 @@
 Provides progressive disclosure loading via SkillRegistry class.
 """
 
-import logging
+from loguru import logger
 from pathlib import Path
 
 from backend.app.config import SKILLS_DIR
@@ -11,7 +11,6 @@ from backend.app.models.skill import SkillMeta, SkillSummary
 from backend.app.core.skill_parser import parse_skill_md
 
 
-logger = logging.getLogger(__name__)
 
 
 class SkillRegistry:
